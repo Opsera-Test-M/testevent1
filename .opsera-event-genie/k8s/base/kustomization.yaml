@@ -11,5 +11,5 @@ commonLabels:
 
 images:
   - name: event-genie
-    newName: PLACEHOLDER_ECR_URI
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/event-genie
+    newTag: aff4669-20260124034501
