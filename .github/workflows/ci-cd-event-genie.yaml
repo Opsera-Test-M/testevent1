@@ -1,0 +1,228 @@
+name: "CI/CD - Build, Push, and Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'tsconfig.json'
+      - '.opsera-event-genie/Dockerfile'
+      - '.opsera-event-genie/nginx.conf'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  APP_NAME: event-genie
+  ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+  HUB_CLUSTER: argocd-usw2
+
+jobs:
+  verify-bootstrap:
+    runs-on: ubuntu-latest
+    outputs:
+      ecr_uri: ${{ steps.check-ecr.outputs.ecr_uri }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID and check ECR
+        id: check-ecr
+        run: |
+          # Get AWS Account ID dynamically (RULE 7)
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}"
+
+          echo "AWS Account ID: ${AWS_ACCOUNT_ID}"
+          echo "ECR URI: ${ECR_URI}"
+
+          # Create ECR repository if not exists
+          if aws ecr describe-repositories --repository-names ${APP_NAME} 2>/dev/null; then
+            echo "ECR repository exists"
+          else
+            echo "Creating ECR repository..."
+            aws ecr create-repository \
+              --repository-name ${APP_NAME} \
+              --image-scanning-configuration scanOnPush=true
+          fi
+
+          echo "ecr_uri=${ECR_URI}" >> $GITHUB_OUTPUT
+
+      - name: Verify ArgoCD Application
+        run: |
+          aws eks update-kubeconfig --name ${HUB_CLUSTER} --region ${AWS_REGION}
+
+          # Install kubectl locally (RULE 25)
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          KUBECTL="./kubectl"
+
+          if $KUBECTL get application ${APP_NAME}-${ENVIRONMENT} -n argocd 2>/dev/null; then
+            echo "ArgoCD application exists"
+          else
+            echo "ERROR: ArgoCD application not found. Run bootstrap-infra.yaml first."
+            exit 1
+          fi
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [verify-bootstrap]
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      ecr_uri: ${{ steps.build.outputs.ecr_uri }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_URI: ${{ needs.verify-bootstrap.outputs.ecr_uri }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          VITE_SUPABASE_PROJECT_ID: ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
+        run: |
+          IMAGE_TAG="${GITHUB_SHA:0:7}-$(date +%Y%m%d%H%M%S)"
+          FULL_IMAGE="${ECR_URI}:${IMAGE_TAG}"
+
+          echo "Building image: ${FULL_IMAGE}"
+
+          docker build \
+            --build-arg VITE_SUPABASE_URL="${VITE_SUPABASE_URL}" \
+            --build-arg VITE_SUPABASE_PUBLISHABLE_KEY="${VITE_SUPABASE_PUBLISHABLE_KEY}" \
+            --build-arg VITE_SUPABASE_PROJECT_ID="${VITE_SUPABASE_PROJECT_ID}" \
+            -t "${FULL_IMAGE}" \
+            -f .opsera-${APP_NAME}/Dockerfile .
+
+          docker push "${FULL_IMAGE}"
+
+          # Output BOTH variables (RULE - DEV2-016)
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "ecr_uri=${ECR_URI}" >> $GITHUB_OUTPUT
+
+  update-kustomize:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Update kustomization.yaml
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          ECR_URI: ${{ needs.build-and-push.outputs.ecr_uri }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # CRITICAL: Pull BEFORE modifying files (RULE 8)
+          git pull --rebase origin main
+
+          KUSTOMIZE_FILE=".opsera-${APP_NAME}/k8s/base/kustomization.yaml"
+
+          # Update image reference
+          sed -i "s|newName:.*|newName: ${ECR_URI}|" "$KUSTOMIZE_FILE"
+          sed -i "s|newTag:.*|newTag: ${IMAGE_TAG}|" "$KUSTOMIZE_FILE"
+
+          echo "Updated kustomization.yaml:"
+          cat "$KUSTOMIZE_FILE"
+
+          git add .
+          git commit -m "chore: update image to ${IMAGE_TAG} [skip ci]"
+          git push
+
+  wait-for-sync:
+    runs-on: ubuntu-latest
+    needs: [update-kustomize]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for ArgoCD Sync
+        run: |
+          aws eks update-kubeconfig --name ${HUB_CLUSTER} --region ${AWS_REGION}
+
+          # Install kubectl locally (RULE 25)
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          KUBECTL="./kubectl"
+
+          echo "Waiting for ArgoCD to sync..."
+
+          MAX_ATTEMPTS=30
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            SYNC_STATUS=$($KUBECTL get application ${APP_NAME}-${ENVIRONMENT} -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+
+            HEALTH_STATUS=$($KUBECTL get application ${APP_NAME}-${ENVIRONMENT} -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+
+            echo "[$ATTEMPT/$MAX_ATTEMPTS] Sync: ${SYNC_STATUS}, Health: ${HEALTH_STATUS}"
+
+            if [ "$SYNC_STATUS" = "Synced" ] && [ "$HEALTH_STATUS" = "Healthy" ]; then
+              echo "Application is synced and healthy!"
+              exit 0
+            fi
+
+            if [ "$SYNC_STATUS" = "Unknown" ]; then
+              echo "WARNING: Sync status Unknown - check ArgoCD for errors"
+            fi
+
+            sleep 10
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "WARNING: Sync not completed within timeout, but continuing..."
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [build-and-push, wait-for-sync]
+    steps:
+      - name: Deployment Summary
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          ECR_URI: ${{ needs.build-and-push.outputs.ecr_uri }}
+        run: |
+          echo "=============================================="
+          echo "  DEPLOYMENT COMPLETE"
+          echo "=============================================="
+          echo "  Application:  ${APP_NAME}"
+          echo "  Environment:  ${ENVIRONMENT}"
+          echo "  Image:        ${ECR_URI}:${IMAGE_TAG}"
+          echo "=============================================="
+          echo ""
+          echo "NEXT STEP:"
+          echo "  Run setup-https-certmanager.yaml for HTTPS"
+          echo "=============================================="

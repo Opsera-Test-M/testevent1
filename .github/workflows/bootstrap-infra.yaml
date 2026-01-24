@@ -1,0 +1,228 @@
+name: "Bootstrap Infrastructure"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Application name'
+        required: true
+        default: 'event-genie'
+        type: string
+      tenant:
+        description: 'Tenant/organization name'
+        required: true
+        default: 'opsera'
+        type: string
+      environment:
+        description: 'Target environment (dev, staging, prod, or custom)'
+        required: true
+        default: 'dev'
+        type: string
+      region:
+        description: 'AWS region'
+        required: true
+        default: 'us-west-2'
+        type: string
+
+env:
+  AWS_REGION: ${{ inputs.region }}
+  APP_NAME: ${{ inputs.app_name }}
+  TENANT: ${{ inputs.tenant }}
+  ENVIRONMENT: ${{ inputs.environment }}
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: ${{ inputs.tenant }}-usw2-np
+  DOMAIN: agent.opsera.dev
+
+jobs:
+  validate-prerequisites:
+    runs-on: ubuntu-latest
+    outputs:
+      subdomain: ${{ steps.generate-subdomain.outputs.subdomain }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate predictable subdomain
+        id: generate-subdomain
+        run: |
+          SUBDOMAIN="${TENANT}-${APP_NAME}-${ENVIRONMENT}.${DOMAIN}"
+          echo "subdomain=${SUBDOMAIN}" >> $GITHUB_OUTPUT
+          echo "Generated subdomain: ${SUBDOMAIN}"
+
+      - name: Verify Dockerfile exists
+        run: |
+          if [ ! -f ".opsera-${APP_NAME}/Dockerfile" ]; then
+            echo "ERROR: Dockerfile not found at .opsera-${APP_NAME}/Dockerfile"
+            exit 1
+          fi
+          echo "Dockerfile found"
+
+  setup-argocd-repo-secret:
+    runs-on: ubuntu-latest
+    needs: [validate-prerequisites]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect to Hub Cluster
+        run: |
+          aws eks update-kubeconfig --name ${HUB_CLUSTER} --region ${AWS_REGION}
+
+      - name: Create ArgoCD Repository Secret
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # Install kubectl locally
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          KUBECTL="./kubectl"
+
+          REPO_URL="https://github.com/${{ github.repository }}.git"
+
+          # Check if secret already exists
+          if $KUBECTL get secret repo-${APP_NAME} -n argocd 2>/dev/null; then
+            echo "Repository secret already exists (skip)"
+          else
+            echo "Creating ArgoCD repository secret..."
+            $KUBECTL create secret generic repo-${APP_NAME} \
+              --namespace argocd \
+              --from-literal=type=git \
+              --from-literal=url=${REPO_URL} \
+              --from-literal=username=git \
+              --from-literal=password=${GH_PAT}
+
+            $KUBECTL label secret repo-${APP_NAME} -n argocd \
+              argocd.argoproj.io/secret-type=repository
+          fi
+
+  update-manifests:
+    runs-on: ubuntu-latest
+    needs: [validate-prerequisites, setup-argocd-repo-secret]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Update ingress subdomain
+        env:
+          SUBDOMAIN: ${{ needs.validate-prerequisites.outputs.subdomain }}
+        run: |
+          INGRESS_FILE=".opsera-${APP_NAME}/k8s/overlays/${ENVIRONMENT}/patch-ingress.yaml"
+
+          if grep -q "PLACEHOLDER_SUBDOMAIN" "$INGRESS_FILE"; then
+            sed -i "s/PLACEHOLDER_SUBDOMAIN/${SUBDOMAIN}/g" "$INGRESS_FILE"
+            echo "Updated ingress with subdomain: ${SUBDOMAIN}"
+          else
+            echo "Subdomain already configured (skip)"
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: configure ${APP_NAME} ${ENVIRONMENT} deployment [skip ci]"
+            git push
+          fi
+
+  create-argocd-application:
+    runs-on: ubuntu-latest
+    needs: [validate-prerequisites, setup-argocd-repo-secret, update-manifests]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect to Hub Cluster
+        run: |
+          aws eks update-kubeconfig --name ${HUB_CLUSTER} --region ${AWS_REGION}
+
+      - name: Pull latest changes
+        run: |
+          git pull origin main
+
+      - name: Create ArgoCD Application
+        run: |
+          # Install kubectl locally
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          KUBECTL="./kubectl"
+
+          APP_MANIFEST=".opsera-${APP_NAME}/argocd/application.yaml"
+
+          # Check if application already exists
+          if $KUBECTL get application ${APP_NAME}-${ENVIRONMENT} -n argocd 2>/dev/null; then
+            echo "ArgoCD application already exists (skip)"
+          else
+            echo "Creating ArgoCD application..."
+            $KUBECTL apply -f "$APP_MANIFEST"
+          fi
+
+      - name: Verify ArgoCD Application
+        run: |
+          # Install kubectl locally
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          KUBECTL="./kubectl"
+
+          echo "Waiting for ArgoCD application to sync..."
+          sleep 30
+
+          SYNC_STATUS=$($KUBECTL get application ${APP_NAME}-${ENVIRONMENT} -n argocd \
+            -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+
+          echo "Sync Status: ${SYNC_STATUS}"
+
+          if [ "$SYNC_STATUS" = "Unknown" ]; then
+            echo "WARNING: Sync status is Unknown - check ArgoCD UI for details"
+          fi
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [validate-prerequisites, create-argocd-application]
+    steps:
+      - name: Bootstrap Summary
+        env:
+          SUBDOMAIN: ${{ needs.validate-prerequisites.outputs.subdomain }}
+        run: |
+          echo "=============================================="
+          echo "  BOOTSTRAP COMPLETE"
+          echo "=============================================="
+          echo "  Application:  ${APP_NAME}"
+          echo "  Environment:  ${ENVIRONMENT}"
+          echo "  Hub Cluster:  ${HUB_CLUSTER}"
+          echo "  Spoke Cluster: ${SPOKE_CLUSTER}"
+          echo "  Subdomain:    ${SUBDOMAIN}"
+          echo "=============================================="
+          echo ""
+          echo "NEXT STEPS:"
+          echo "  1. Run ci-cd-${APP_NAME}.yaml workflow to build and deploy"
+          echo "  2. Run setup-https-certmanager.yaml for HTTPS"
+          echo "=============================================="
