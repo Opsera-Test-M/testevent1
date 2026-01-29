@@ -17,7 +17,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: PLACEHOLDER_REPO_URL
+    repoURL: https://github.com/Opsera-Test-M/testevent1
     targetRevision: main
     path: .opsera-play1/k8s/overlays/dev
   destination:
