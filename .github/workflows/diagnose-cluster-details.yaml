@@ -1,0 +1,208 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Deep Cluster Diagnostic
+# Shows full details of cluster secrets including endpoints
+# =============================================================================
+name: "🔬 Deep Cluster Diagnostic"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name to inspect'
+        required: true
+        default: 'opsera-usw2-np'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+
+jobs:
+  deep-diagnostic:
+    name: "🔬 Deep Cluster Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          
+          # Install jq for JSON parsing
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Connect to Hub Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          echo "✅ Connected to ArgoCD hub cluster: ${{ env.HUB_CLUSTER }}"
+
+      - name: Deep Cluster Analysis
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  🔬 DEEP ARGOCD CLUSTER DIAGNOSTIC                                               ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          TARGET_CLUSTER="${{ inputs.cluster_name }}"
+          
+          echo "🎯 Target Cluster Name: ${TARGET_CLUSTER}"
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo ""
+          
+          # Get all cluster secrets
+          SECRETS=$(kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster -o json)
+          
+          # Count total clusters
+          TOTAL=$(echo "$SECRETS" | jq '.items | length')
+          echo "📊 Total clusters registered in ArgoCD: ${TOTAL}"
+          echo ""
+          
+          # Find matching clusters
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo "🔍 SEARCHING FOR CLUSTERS NAMED: ${TARGET_CLUSTER}"
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo ""
+          
+          MATCH_COUNT=0
+          
+          echo "$SECRETS" | jq -r '.items[] | @base64' | while read secret; do
+            # Decode the secret
+            SECRET_NAME=$(echo "$secret" | base64 -d | jq -r '.metadata.name')
+            CREATED=$(echo "$secret" | base64 -d | jq -r '.metadata.creationTimestamp')
+            
+            # Get and decode data fields
+            CLUSTER_NAME_B64=$(echo "$secret" | base64 -d | jq -r '.data.name // empty')
+            SERVER_B64=$(echo "$secret" | base64 -d | jq -r '.data.server // empty')
+            
+            if [ -n "$CLUSTER_NAME_B64" ]; then
+              CLUSTER_NAME=$(echo "$CLUSTER_NAME_B64" | base64 -d 2>/dev/null || echo "decode-error")
+              
+              if [ "$CLUSTER_NAME" = "$TARGET_CLUSTER" ]; then
+                MATCH_COUNT=$((MATCH_COUNT + 1))
+                
+                # Decode server URL
+                if [ -n "$SERVER_B64" ]; then
+                  SERVER_URL=$(echo "$SERVER_B64" | base64 -d 2>/dev/null || echo "decode-error")
+                else
+                  SERVER_URL="not-set"
+                fi
+                
+                echo "┌──────────────────────────────────────────────────────────────────────────────────┐"
+                echo "│  📦 MATCH #${MATCH_COUNT}                                                        "
+                echo "├──────────────────────────────────────────────────────────────────────────────────┤"
+                echo "│"
+                echo "│  🏷️  Secret Name:     ${SECRET_NAME}"
+                echo "│  📛  Cluster Name:    ${CLUSTER_NAME}"
+                echo "│  🌐  Server Endpoint: ${SERVER_URL}"
+                echo "│  📅  Created:         ${CREATED}"
+                echo "│"
+                echo "└──────────────────────────────────────────────────────────────────────────────────┘"
+                echo ""
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo "📋 ANALYSIS COMPLETE"
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+
+      - name: Compare with Actual EKS Cluster
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo "🔗 COMPARING WITH ACTUAL EKS CLUSTER"
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo ""
+          
+          TARGET_CLUSTER="${{ inputs.cluster_name }}"
+          
+          # Get actual EKS cluster endpoint
+          echo "📡 Fetching actual EKS cluster endpoint for: ${TARGET_CLUSTER}"
+          echo ""
+          
+          ACTUAL_ENDPOINT=$(aws eks describe-cluster --name "${TARGET_CLUSTER}" --region ${{ env.AWS_REGION }} --query 'cluster.endpoint' --output text 2>/dev/null || echo "NOT_FOUND")
+          ACTUAL_STATUS=$(aws eks describe-cluster --name "${TARGET_CLUSTER}" --region ${{ env.AWS_REGION }} --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")
+          ACTUAL_VERSION=$(aws eks describe-cluster --name "${TARGET_CLUSTER}" --region ${{ env.AWS_REGION }} --query 'cluster.version' --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          echo "┌──────────────────────────────────────────────────────────────────────────────────┐"
+          echo "│  🎯 ACTUAL EKS CLUSTER: ${TARGET_CLUSTER}                                        "
+          echo "├──────────────────────────────────────────────────────────────────────────────────┤"
+          echo "│"
+          echo "│  🌐  Endpoint:    ${ACTUAL_ENDPOINT}"
+          echo "│  📊  Status:      ${ACTUAL_STATUS}"
+          echo "│  🏷️   Version:     ${ACTUAL_VERSION}"
+          echo "│"
+          echo "└──────────────────────────────────────────────────────────────────────────────────┘"
+          echo ""
+          
+          # Save for comparison
+          echo "${ACTUAL_ENDPOINT}" > /tmp/actual_endpoint.txt
+
+      - name: Recommendation
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo "💡 RECOMMENDATION"
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo ""
+          
+          TARGET_CLUSTER="${{ inputs.cluster_name }}"
+          ACTUAL_ENDPOINT=$(cat /tmp/actual_endpoint.txt)
+          
+          # Get cluster secrets again for comparison
+          SECRETS=$(kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster -o json)
+          
+          echo "Comparing ArgoCD secret endpoints with actual EKS endpoint..."
+          echo ""
+          
+          VALID_SECRET=""
+          INVALID_SECRETS=""
+          
+          echo "$SECRETS" | jq -r '.items[] | @base64' | while read secret; do
+            SECRET_NAME=$(echo "$secret" | base64 -d | jq -r '.metadata.name')
+            CLUSTER_NAME_B64=$(echo "$secret" | base64 -d | jq -r '.data.name // empty')
+            SERVER_B64=$(echo "$secret" | base64 -d | jq -r '.data.server // empty')
+            
+            if [ -n "$CLUSTER_NAME_B64" ]; then
+              CLUSTER_NAME=$(echo "$CLUSTER_NAME_B64" | base64 -d 2>/dev/null || echo "")
+              
+              if [ "$CLUSTER_NAME" = "$TARGET_CLUSTER" ]; then
+                SERVER_URL=$(echo "$SERVER_B64" | base64 -d 2>/dev/null || echo "")
+                
+                if [ "$SERVER_URL" = "$ACTUAL_ENDPOINT" ]; then
+                  echo "✅ ${SECRET_NAME} → VALID (endpoint matches EKS)"
+                else
+                  echo "⚠️  ${SECRET_NAME} → STALE or DIFFERENT endpoint"
+                  echo "    Secret endpoint:  ${SERVER_URL}"
+                  echo "    Actual endpoint:  ${ACTUAL_ENDPOINT}"
+                fi
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo "🔧 NEXT STEPS"
+          echo "════════════════════════════════════════════════════════════════════════════════════"
+          echo ""
+          echo "Based on the analysis above:"
+          echo ""
+          echo "1. If both secrets have the SAME endpoint → They are true duplicates"
+          echo "   → Delete one using: kubectl delete secret <secret-name> -n argocd"
+          echo ""
+          echo "2. If secrets have DIFFERENT endpoints → One may be stale"
+          echo "   → Keep the one matching the actual EKS endpoint"
+          echo "   → Delete the stale one"
+          echo ""
+          echo "3. To delete via GitHub Actions, run:"
+          echo "   gh workflow run 'fix-duplicate-clusters.yaml' -f action=fix -f cluster_name=${TARGET_CLUSTER}"
+          echo ""
