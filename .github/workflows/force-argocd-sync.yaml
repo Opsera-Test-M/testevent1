@@ -1,0 +1,133 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Force ArgoCD Sync
+# =============================================================================
+name: "🔄 Force ArgoCD Sync"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Application name'
+        required: true
+        default: 'play1'
+        type: string
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+
+jobs:
+  force-sync:
+    name: "🔄 Force Sync"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Hub Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Force Hard Refresh
+        run: |
+          APP_NAME="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  🔄 FORCING ARGOCD SYNC                                                          ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "Application: ${APP_NAME}"
+          echo ""
+          
+          # Step 1: Force hard refresh
+          echo "Step 1: Triggering hard refresh..."
+          kubectl annotate application "${APP_NAME}" -n argocd \
+            argocd.argoproj.io/refresh=hard --overwrite
+          
+          sleep 5
+          
+          # Step 2: Check current status
+          echo ""
+          echo "Step 2: Current status after refresh..."
+          kubectl get application "${APP_NAME}" -n argocd -o wide
+          
+          # Step 3: Force sync with prune
+          echo ""
+          echo "Step 3: Triggering sync with replace..."
+          kubectl patch application "${APP_NAME}" -n argocd --type merge -p '{"operation":{"initiatedBy":{"username":"github-actions"},"sync":{"prune":true,"syncStrategy":{"apply":{"force":true}}}}}'
+          
+          sleep 10
+          
+          # Step 4: Check status again
+          echo ""
+          echo "Step 4: Status after sync..."
+          kubectl get application "${APP_NAME}" -n argocd -o wide
+          
+          # Step 5: Show resource details
+          echo ""
+          echo "Step 5: Resource details..."
+          kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{range .status.resources[*]}{.kind}: {.name} - {.status} - {.health.status}{"\n"}{end}'
+
+      - name: Wait for Healthy Status
+        run: |
+          APP_NAME="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          echo ""
+          echo "Waiting for application to become healthy..."
+          
+          for i in {1..60}; do
+            SYNC=$(kubectl get application "${APP_NAME}" -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+            HEALTH=$(kubectl get application "${APP_NAME}" -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+            
+            echo "[$i/60] Sync: ${SYNC} | Health: ${HEALTH}"
+            
+            if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo ""
+              echo "✅ Application is synced and healthy!"
+              exit 0
+            fi
+            
+            sleep 5
+          done
+          
+          echo ""
+          echo "⚠️ Timeout - Application may still be syncing"
+
+      - name: Final Summary
+        run: |
+          APP_NAME="${{ inputs.app_name }}-${{ inputs.environment }}"
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  📊 SYNC SUMMARY                                                                 ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          # Get spoke cluster context
+          aws eks update-kubeconfig --name opsera-usw2-np --region ${{ env.AWS_REGION }}
+          
+          echo "Pod Status:"
+          kubectl get pods -n "${NAMESPACE}" -o wide 2>/dev/null || echo "No pods found"
+          echo ""
+          
+          echo "Deployment Image:"
+          kubectl get deployment -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || echo "Not found"
+          echo ""
