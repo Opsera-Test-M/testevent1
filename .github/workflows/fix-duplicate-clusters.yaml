@@ -1,0 +1,198 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Fix Duplicate ArgoCD Clusters
+# One-time diagnostic and fix workflow
+# =============================================================================
+name: "🔧 Fix Duplicate ArgoCD Clusters"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'diagnose'
+        type: choice
+        options:
+          - diagnose
+          - fix
+      cluster_name:
+        description: 'Cluster name to check for duplicates'
+        required: true
+        default: 'opsera-usw2-np'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+
+jobs:
+  fix-duplicates:
+    name: "🔍 ${{ inputs.action == 'diagnose' && 'Diagnose' || 'Fix' }} Duplicate Clusters"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Hub Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          echo "✅ Connected to ArgoCD hub cluster: ${{ env.HUB_CLUSTER }}"
+
+      - name: Diagnose Duplicate Clusters
+        id: diagnose
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════╗"
+          echo "║  🔍 ARGOCD CLUSTER DIAGNOSTIC                                    ║"
+          echo "╚══════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          echo "📋 Searching for clusters named: ${CLUSTER_NAME}"
+          echo ""
+          echo "=== All Registered Clusters ==="
+          
+          # Get all cluster secrets
+          kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.data.name}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}' > /tmp/clusters.txt
+          
+          echo ""
+          echo "| Secret Name | Cluster Name | Created |"
+          echo "|-------------|--------------|---------|"
+          
+          MATCHING_SECRETS=""
+          MATCHING_COUNT=0
+          
+          while IFS=$'\t' read -r secret_name encoded_name created; do
+            if [ -n "$encoded_name" ]; then
+              decoded_name=$(echo "$encoded_name" | base64 -d 2>/dev/null || echo "decode-error")
+              echo "| ${secret_name} | ${decoded_name} | ${created} |"
+              
+              if [ "$decoded_name" = "$CLUSTER_NAME" ]; then
+                MATCHING_COUNT=$((MATCHING_COUNT + 1))
+                MATCHING_SECRETS="${MATCHING_SECRETS}${secret_name},"
+              fi
+            fi
+          done < /tmp/clusters.txt
+          
+          echo ""
+          echo "=== Duplicate Analysis ==="
+          echo ""
+          echo "Target cluster: ${CLUSTER_NAME}"
+          echo "Matching secrets: ${MATCHING_COUNT}"
+          echo "Secret names: ${MATCHING_SECRETS}"
+          echo ""
+          
+          if [ "$MATCHING_COUNT" -eq 0 ]; then
+            echo "❌ No cluster named '${CLUSTER_NAME}' found!"
+            echo "duplicate=false" >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+          elif [ "$MATCHING_COUNT" -eq 1 ]; then
+            echo "✅ Cluster '${CLUSTER_NAME}' is unique - no duplicates found!"
+            echo "duplicate=false" >> $GITHUB_OUTPUT
+            echo "count=1" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ DUPLICATES DETECTED: Found ${MATCHING_COUNT} clusters with name '${CLUSTER_NAME}'"
+            echo ""
+            echo "Duplicate secrets:"
+            for secret in $(echo $MATCHING_SECRETS | tr ',' ' '); do
+              if [ -n "$secret" ]; then
+                echo "  - ${secret}"
+              fi
+            done
+            echo ""
+            echo "duplicate=true" >> $GITHUB_OUTPUT
+            echo "count=${MATCHING_COUNT}" >> $GITHUB_OUTPUT
+            echo "secrets=${MATCHING_SECRETS}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fix Duplicates (Keep Oldest)
+        if: inputs.action == 'fix' && steps.diagnose.outputs.duplicate == 'true'
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════╗"
+          echo "║  🔧 FIXING DUPLICATE CLUSTERS                                    ║"
+          echo "╚══════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          # Get matching secrets sorted by creation time (oldest first)
+          echo "📋 Finding duplicates for: ${CLUSTER_NAME}"
+          echo ""
+          
+          FIRST=true
+          KEPT_SECRET=""
+          DELETED_COUNT=0
+          
+          kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            --sort-by='.metadata.creationTimestamp' \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.data.name}{"\n"}{end}' | \
+          while IFS=$'\t' read -r secret_name encoded_name; do
+            if [ -n "$encoded_name" ]; then
+              decoded_name=$(echo "$encoded_name" | base64 -d 2>/dev/null || echo "")
+              
+              if [ "$decoded_name" = "$CLUSTER_NAME" ]; then
+                if [ "$FIRST" = true ]; then
+                  echo "✅ KEEPING (oldest): ${secret_name}"
+                  KEPT_SECRET="${secret_name}"
+                  FIRST=false
+                else
+                  echo "🗑️ DELETING duplicate: ${secret_name}"
+                  kubectl delete secret "${secret_name}" -n argocd
+                  DELETED_COUNT=$((DELETED_COUNT + 1))
+                fi
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "✅ Duplicate cleanup complete!"
+
+      - name: Verify Fix
+        if: inputs.action == 'fix'
+        run: |
+          echo ""
+          echo "=== Verification ==="
+          echo ""
+          
+          CLUSTER_NAME="${{ inputs.cluster_name }}"
+          
+          COUNT=$(kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            -o jsonpath='{range .items[*]}{.data.name}{"\n"}{end}' | \
+            while read encoded; do echo "$encoded" | base64 -d 2>/dev/null; done | \
+            grep -c "^${CLUSTER_NAME}$" || echo "0")
+          
+          if [ "$COUNT" -eq 1 ]; then
+            echo "✅ SUCCESS: Cluster '${CLUSTER_NAME}' is now unique (1 instance)"
+          else
+            echo "⚠️ Found ${COUNT} instances of '${CLUSTER_NAME}'"
+          fi
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════╗"
+          echo "║  📊 SUMMARY                                                      ║"
+          echo "╚══════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "Action performed: ${{ inputs.action }}"
+          echo "Target cluster: ${{ inputs.cluster_name }}"
+          echo "Duplicates found: ${{ steps.diagnose.outputs.duplicate }}"
+          echo "Count: ${{ steps.diagnose.outputs.count }}"
+          echo ""
+          
+          if [ "${{ inputs.action }}" = "diagnose" ] && [ "${{ steps.diagnose.outputs.duplicate }}" = "true" ]; then
+            echo "🔧 To fix, re-run this workflow with action: 'fix'"
+          elif [ "${{ inputs.action }}" = "fix" ]; then
+            echo "✅ You can now re-run the bootstrap workflow!"
+          fi
