@@ -1,0 +1,66 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Check ECR Images
+# =============================================================================
+name: "🔍 Check ECR Images"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Application name'
+        required: true
+        default: 'play1'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  check:
+    name: "🔍 Check ECR"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECR Repository
+        run: |
+          REPO="opsera/${{ inputs.app_name }}"
+          
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  🔍 ECR IMAGE CHECK                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          echo "=== Repository: ${REPO} ==="
+          aws ecr describe-repositories --repository-names "${REPO}" 2>&1 && echo "✅ Repository exists" || {
+            echo "❌ Repository NOT FOUND"
+            echo ""
+            echo "Creating repository..."
+            aws ecr create-repository --repository-name "${REPO}" --image-scanning-configuration scanOnPush=true
+          }
+          
+          echo ""
+          echo "=== All Images in Repository ==="
+          aws ecr list-images --repository-name "${REPO}" --output table 2>/dev/null || echo "No images found"
+          
+          echo ""
+          echo "=== Detailed Image Info (last 10) ==="
+          aws ecr describe-images --repository-name "${REPO}" \
+            --query 'imageDetails | sort_by(@, &imagePushedAt) | [-10:].[{Tag: imageTags[0], PushedAt: imagePushedAt, SizeBytes: imageSizeInBytes, Digest: imageDigest}]' \
+            --output table 2>/dev/null || echo "No images"
+          
+          echo ""
+          echo "=== Check for 'latest' tag ==="
+          aws ecr describe-images --repository-name "${REPO}" \
+            --image-ids imageTag=latest 2>&1 && echo "✅ 'latest' tag exists" || echo "⚠️ 'latest' tag does NOT exist"
+          
+          echo ""
+          echo "=== Check for specific tag ==="
+          TAG="5d5ab1c-20260129031747"
+          aws ecr describe-images --repository-name "${REPO}" \
+            --image-ids imageTag="${TAG}" 2>&1 && echo "✅ Tag '${TAG}' exists" || echo "⚠️ Tag '${TAG}' does NOT exist"
