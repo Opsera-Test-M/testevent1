@@ -14,7 +14,5 @@ commonLabels:
   app.kubernetes.io/name: play1
   app.kubernetes.io/managed-by: opsera
 
-images:
-  - name: play1
-    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/opsera/play1
-    newTag: latest
+# Note: Image transformation is handled by overlays (dev/staging/prod)
+# Each overlay sets the specific image tag via the images section

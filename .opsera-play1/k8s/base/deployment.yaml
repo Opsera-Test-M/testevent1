@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: play1
-        image: play1:latest
+        image: play1
         ports:
         - containerPort: 8080
           name: http
