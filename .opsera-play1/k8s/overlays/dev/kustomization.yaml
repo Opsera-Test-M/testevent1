@@ -22,4 +22,4 @@ commonAnnotations:
 images:
   - name: play1
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/opsera/play1
-    newTag: ea1d29c-20260129025122
+    newTag: 5d5ab1c-20260129031747
