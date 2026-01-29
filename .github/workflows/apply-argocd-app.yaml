@@ -1,0 +1,122 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Apply ArgoCD Application
+# =============================================================================
+name: "🔧 Apply ArgoCD Application"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Application name'
+        required: true
+        default: 'play1'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+jobs:
+  apply:
+    name: "🔧 Apply & Sync"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Apply ArgoCD Application
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  🔧 APPLYING ARGOCD APPLICATION                                                  ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          # Connect to Hub Cluster
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "=== Current ArgoCD Application ==="
+          kubectl get application ${{ inputs.app_name }}-dev -n argocd -o yaml | head -40 || echo "Not found"
+          echo ""
+          
+          echo "=== Applying updated Application ==="
+          kubectl apply -f .opsera-${{ inputs.app_name }}/argocd/application.yaml
+          echo ""
+          
+          echo "=== Triggering hard refresh ==="
+          kubectl annotate application ${{ inputs.app_name }}-dev -n argocd \
+            argocd.argoproj.io/refresh=hard --overwrite
+          
+          sleep 5
+          
+          echo "=== New Application Status ==="
+          kubectl get application ${{ inputs.app_name }}-dev -n argocd -o wide
+
+      - name: Wait for Sync
+        run: |
+          APP_NAME="${{ inputs.app_name }}-dev"
+          NAMESPACE="${{ inputs.app_name }}-dev"
+          
+          echo ""
+          echo "Waiting for application to sync and become healthy..."
+          
+          for i in {1..60}; do
+            SYNC=$(kubectl get application "${APP_NAME}" -n argocd \
+              -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+            HEALTH=$(kubectl get application "${APP_NAME}" -n argocd \
+              -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+            REVISION=$(kubectl get application "${APP_NAME}" -n argocd \
+              -o jsonpath='{.status.sync.revision}' 2>/dev/null || echo "Unknown")
+            
+            echo "[$i/60] Sync: ${SYNC} | Health: ${HEALTH} | Rev: ${REVISION:0:7}"
+            
+            if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then
+              echo ""
+              echo "✅ Application is synced and healthy!"
+              break
+            fi
+            
+            sleep 5
+          done
+
+      - name: Verify Deployment
+        run: |
+          NAMESPACE="${{ inputs.app_name }}-dev"
+          
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  📊 DEPLOYMENT VERIFICATION                                                      ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          # Switch to Spoke Cluster
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          echo "=== Pods ==="
+          kubectl get pods -n "${NAMESPACE}" -o wide
+          echo ""
+          
+          echo "=== Deployment Image ==="
+          IMAGE=$(kubectl get deployment -n "${NAMESPACE}" -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || echo "Not found")
+          echo "Image: ${IMAGE}"
+          echo ""
+          
+          if [[ "${IMAGE}" == *":latest"* ]]; then
+            echo "❌ ERROR: Image tag is still 'latest' - Kustomize not applied!"
+            exit 1
+          else
+            echo "✅ Image tag is correctly set from Kustomize!"
+          fi
