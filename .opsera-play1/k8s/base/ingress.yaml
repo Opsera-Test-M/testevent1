@@ -1,0 +1,31 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Kubernetes Ingress (Base)
+# Skill Version: 4.0.0
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: play1
+  labels:
+    app: play1
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - PLACEHOLDER_SUBDOMAIN
+    secretName: play1-tls
+  rules:
+  - host: PLACEHOLDER_SUBDOMAIN
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: play1
+            port:
+              number: 80

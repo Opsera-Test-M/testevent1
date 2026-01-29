@@ -1,0 +1,19 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Kubernetes Service
+# Skill Version: 4.0.0
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: play1
+  labels:
+    app: play1
+spec:
+  type: ClusterIP
+  selector:
+    app: play1
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP

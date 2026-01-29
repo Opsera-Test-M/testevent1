@@ -1,0 +1,10 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Replica Count Patch (Dev)
+# Skill Version: 4.0.0
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: play1
+spec:
+  replicas: 1

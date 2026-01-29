@@ -1,0 +1,57 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Kubernetes Deployment
+# Skill Version: 4.0.0
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: play1
+  labels:
+    app: play1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: play1
+  template:
+    metadata:
+      labels:
+        app: play1
+    spec:
+      containers:
+      - name: play1
+        image: play1:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          periodSeconds: 2
+          failureThreshold: 30
+      imagePullSecrets: []

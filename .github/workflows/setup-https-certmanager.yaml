@@ -1,0 +1,270 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - HTTPS + cert-manager Setup
+# Skill Version: 4.0.0
+# App: play1 | Cloud: AWS | Tenant: opsera
+# =============================================================================
+name: "🔐 Setup HTTPS (cert-manager)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Base domain (e.g., agent.opsera.dev)'
+        required: true
+        default: 'agent.opsera.dev'
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      email:
+        description: 'Email for Let''s Encrypt notifications'
+        required: true
+        default: 'devops@opsera.io'
+        type: string
+
+env:
+  APP_NAME: play1
+  TENANT: opsera
+  AWS_REGION: us-west-2
+  SPOKE_CLUSTER: opsera-usw2-np
+  OPSERA_FOLDER: .opsera-play1
+
+jobs:
+  # =========================================================================
+  # Job 1: Install cert-manager
+  # =========================================================================
+  install-cert-manager:
+    name: "📦 Install cert-manager"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Connect to Spoke Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Install cert-manager
+        run: |
+          # Check if cert-manager is already installed
+          if kubectl get namespace cert-manager 2>/dev/null; then
+            echo "✅ cert-manager namespace already exists"
+            
+            if kubectl get deployment cert-manager -n cert-manager 2>/dev/null; then
+              echo "✅ cert-manager is already installed"
+              kubectl get pods -n cert-manager
+              exit 0
+            fi
+          fi
+          
+          echo "📦 Installing cert-manager..."
+          
+          # Add Jetstack Helm repository
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+          
+          # Install cert-manager with CRDs
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager \
+            --create-namespace \
+            --version v1.14.4 \
+            --set installCRDs=true \
+            --set prometheus.enabled=false \
+            --wait --timeout 5m
+          
+          echo "✅ cert-manager installed successfully"
+          kubectl get pods -n cert-manager
+
+  # =========================================================================
+  # Job 2: Create ClusterIssuer
+  # =========================================================================
+  create-cluster-issuer:
+    name: "🔑 Create ClusterIssuer"
+    runs-on: ubuntu-latest
+    needs: install-cert-manager
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Spoke Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Create ClusterIssuer
+        run: |
+          # Check if ClusterIssuer already exists
+          if kubectl get clusterissuer letsencrypt-prod 2>/dev/null; then
+            echo "✅ ClusterIssuer 'letsencrypt-prod' already exists"
+            kubectl get clusterissuer letsencrypt-prod -o yaml
+            exit 0
+          fi
+          
+          echo "🔑 Creating ClusterIssuer..."
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: ${{ inputs.email }}
+              privateKeySecretRef:
+                name: letsencrypt-prod-key
+              solvers:
+                - http01:
+                    ingress:
+                      class: nginx
+          EOF
+          
+          echo "✅ ClusterIssuer created"
+          
+          # Wait for ClusterIssuer to be ready
+          sleep 10
+          kubectl get clusterissuer letsencrypt-prod
+
+  # =========================================================================
+  # Job 3: Update Ingress with Domain
+  # =========================================================================
+  update-ingress:
+    name: "🌐 Update Ingress"
+    runs-on: ubuntu-latest
+    needs: create-cluster-issuer
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Pull latest changes
+        run: git pull --rebase origin main
+
+      - name: Update Ingress Host
+        run: |
+          SUBDOMAIN="${{ env.APP_NAME }}.${{ inputs.domain }}"
+          ENV="${{ inputs.environment }}"
+          
+          # Update base ingress
+          sed -i "s|PLACEHOLDER_SUBDOMAIN|${SUBDOMAIN}|g" \
+            "${{ env.OPSERA_FOLDER }}/k8s/base/ingress.yaml"
+          
+          # Update overlay ingress patch
+          sed -i "s|PLACEHOLDER_SUBDOMAIN|${SUBDOMAIN}|g" \
+            "${{ env.OPSERA_FOLDER }}/k8s/overlays/${ENV}/patch-ingress.yaml"
+          
+          echo "✅ Updated ingress with host: ${SUBDOMAIN}"
+          
+          echo "=== Base Ingress ==="
+          cat "${{ env.OPSERA_FOLDER }}/k8s/base/ingress.yaml"
+          
+          echo "=== Overlay Ingress Patch ==="
+          cat "${{ env.OPSERA_FOLDER }}/k8s/overlays/${ENV}/patch-ingress.yaml"
+
+      - name: Commit and Push
+        run: |
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: configure HTTPS for ${{ env.APP_NAME }}.${{ inputs.domain }}"
+            git push origin main
+          fi
+
+  # =========================================================================
+  # Job 4: Verify HTTPS
+  # =========================================================================
+  verify-https:
+    name: "✅ Verify HTTPS"
+    runs-on: ubuntu-latest
+    needs: update-ingress
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Connect to Spoke Cluster
+        run: |
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Wait for Certificate
+        run: |
+          NAMESPACE="${{ env.APP_NAME }}-${{ inputs.environment }}"
+          
+          echo "⏳ Waiting for certificate to be issued..."
+          
+          for i in {1..60}; do
+            CERT_STATUS=$(kubectl get certificate -n ${NAMESPACE} -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+            
+            echo "[$i/60] Certificate status: ${CERT_STATUS}"
+            
+            if [ "$CERT_STATUS" = "True" ]; then
+              echo "✅ Certificate is ready!"
+              kubectl get certificate -n ${NAMESPACE}
+              break
+            fi
+            
+            sleep 10
+          done
+
+      - name: Display Summary
+        run: |
+          SUBDOMAIN="${{ env.APP_NAME }}.${{ inputs.domain }}"
+          
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  🐦 OPSERA - HTTPS Setup Complete                                                ║"
+          echo "╠══════════════════════════════════════════════════════════════════════════════════╣"
+          echo "║                                                                                  ║"
+          echo "║  Your app is now accessible at:                                                  ║"
+          echo "║                                                                                  ║"
+          echo "║      🔒 https://${SUBDOMAIN}                                                     ║"
+          echo "║                                                                                  ║"
+          echo "║  Note: DNS propagation may take a few minutes.                                   ║"
+          echo "║  Certificate issuance typically takes 1-5 minutes.                               ║"
+          echo "║                                                                                  ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"

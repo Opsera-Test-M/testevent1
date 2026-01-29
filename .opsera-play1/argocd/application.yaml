@@ -1,0 +1,38 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - ArgoCD Application
+# Skill Version: 4.0.0
+# =============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: play1-dev
+  namespace: argocd
+  labels:
+    app: play1
+    environment: dev
+    tenant: opsera
+    managed-by: opsera
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: PLACEHOLDER_REPO_URL
+    targetRevision: main
+    path: .opsera-play1/k8s/overlays/dev
+  destination:
+    name: opsera-usw2-np
+    namespace: play1-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

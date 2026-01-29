@@ -1,0 +1,12 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Kubernetes Namespace
+# Skill Version: 4.0.0
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: play1-dev
+  labels:
+    app: play1
+    environment: dev
+    managed-by: opsera
