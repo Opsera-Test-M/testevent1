@@ -1,0 +1,338 @@
+# =============================================================================
+# 🐦 OPSERA DevOps Copilot - Deployment Debugger
+# Deep dive into ArgoCD, Pod, and Service issues
+# =============================================================================
+name: "🔍 Debug Deployment"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Application name'
+        required: true
+        default: 'play1'
+        type: string
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: string
+
+env:
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  debug:
+    name: "🔍 Deep Dive Debug"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install tools
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          sudo apt-get update && sudo apt-get install -y jq
+
+      # =====================================================================
+      # SECTION 1: ArgoCD Application Status
+      # =====================================================================
+      - name: "1️⃣ Check ArgoCD Application Status"
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  1️⃣ ARGOCD APPLICATION STATUS                                                   ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          # Connect to Hub Cluster (ArgoCD)
+          aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          APP_NAME="${{ inputs.app_name }}-${{ inputs.environment }}"
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          echo "📋 Application: ${APP_NAME}"
+          echo ""
+          
+          # Get application status
+          echo "=== Application Overview ==="
+          kubectl get application "${APP_NAME}" -n argocd -o wide 2>/dev/null || echo "❌ Application not found"
+          echo ""
+          
+          # Get sync status
+          echo "=== Sync Status ==="
+          SYNC_STATUS=$(kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+          HEALTH_STATUS=$(kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+          SYNC_MESSAGE=$(kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{.status.conditions[*].message}' 2>/dev/null || echo "None")
+          
+          echo "Sync Status:   ${SYNC_STATUS}"
+          echo "Health Status: ${HEALTH_STATUS}"
+          echo "Message:       ${SYNC_MESSAGE}"
+          echo ""
+          
+          # Get resource status
+          echo "=== Resource Status ==="
+          kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{range .status.resources[*]}{.kind}{"\t"}{.name}{"\t"}{.status}{"\t"}{.health.status}{"\n"}{end}' 2>/dev/null | \
+            column -t -s $'\t' || echo "No resources found"
+          echo ""
+          
+          # Get conditions
+          echo "=== Conditions ==="
+          kubectl get application "${APP_NAME}" -n argocd -o jsonpath='{range .status.conditions[*]}Type: {.type}, Message: {.message}{"\n"}{end}' 2>/dev/null || echo "No conditions"
+
+      # =====================================================================
+      # SECTION 2: Pod Status on Spoke Cluster
+      # =====================================================================
+      - name: "2️⃣ Check Pod Status"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  2️⃣ POD STATUS (Spoke Cluster)                                                  ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          # Connect to Spoke Cluster
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          APP_NAME="${{ inputs.app_name }}"
+          
+          echo "📋 Namespace: ${NAMESPACE}"
+          echo ""
+          
+          # Check if namespace exists
+          echo "=== Namespace Status ==="
+          kubectl get namespace "${NAMESPACE}" 2>/dev/null || echo "❌ Namespace not found!"
+          echo ""
+          
+          # Get all resources in namespace
+          echo "=== All Resources in Namespace ==="
+          kubectl get all -n "${NAMESPACE}" 2>/dev/null || echo "No resources found"
+          echo ""
+          
+          # Get pod details
+          echo "=== Pod Details ==="
+          kubectl get pods -n "${NAMESPACE}" -o wide 2>/dev/null || echo "No pods found"
+          echo ""
+          
+          # Get pod status breakdown
+          echo "=== Pod Status Breakdown ==="
+          kubectl get pods -n "${NAMESPACE}" -o jsonpath='{range .items[*]}Pod: {.metadata.name}{"\n"}  Phase: {.status.phase}{"\n"}  Ready: {.status.conditions[?(@.type=="Ready")].status}{"\n"}  Containers:{"\n"}{range .status.containerStatuses[*]}    - {.name}: {.state}{"\n"}{end}{"\n"}{end}' 2>/dev/null || echo "No pods"
+
+      # =====================================================================
+      # SECTION 3: Container Status & Reasons
+      # =====================================================================
+      - name: "3️⃣ Check Container Issues"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  3️⃣ CONTAINER ISSUES                                                            ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          # Check for waiting containers
+          echo "=== Containers in Waiting State ==="
+          kubectl get pods -n "${NAMESPACE}" -o json 2>/dev/null | jq -r '
+            .items[] | 
+            select(.status.containerStatuses != null) |
+            .status.containerStatuses[] | 
+            select(.state.waiting != null) |
+            "Pod: \(.name)\n  Reason: \(.state.waiting.reason)\n  Message: \(.state.waiting.message // "none")\n"
+          ' || echo "No waiting containers"
+          echo ""
+          
+          # Check for image pull issues
+          echo "=== Image Pull Status ==="
+          kubectl get pods -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.containerStatuses[0].state.waiting.reason}{"\n"}{end}' 2>/dev/null | grep -v ": $" || echo "No image issues detected"
+          echo ""
+          
+          # Describe pods with issues
+          echo "=== Pod Descriptions (for troubleshooting) ==="
+          for pod in $(kubectl get pods -n "${NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "--- Pod: ${pod} ---"
+            kubectl describe pod "${pod}" -n "${NAMESPACE}" 2>/dev/null | grep -A 10 "Events:" || echo "No events"
+            echo ""
+          done
+
+      # =====================================================================
+      # SECTION 4: Events
+      # =====================================================================
+      - name: "4️⃣ Check Events"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  4️⃣ KUBERNETES EVENTS                                                           ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          echo "=== Recent Events (sorted by time) ==="
+          kubectl get events -n "${NAMESPACE}" --sort-by='.lastTimestamp' 2>/dev/null | tail -30 || echo "No events found"
+          echo ""
+          
+          echo "=== Warning Events ==="
+          kubectl get events -n "${NAMESPACE}" --field-selector type=Warning 2>/dev/null || echo "No warning events"
+
+      # =====================================================================
+      # SECTION 5: Logs
+      # =====================================================================
+      - name: "5️⃣ Check Pod Logs"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  5️⃣ POD LOGS                                                                    ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          APP_NAME="${{ inputs.app_name }}"
+          
+          # Get logs from current pod
+          echo "=== Current Pod Logs (last 50 lines) ==="
+          kubectl logs -n "${NAMESPACE}" -l app="${APP_NAME}" --tail=50 2>/dev/null || echo "No logs available"
+          echo ""
+          
+          # Get logs from previous pod (if crashed)
+          echo "=== Previous Pod Logs (if crashed) ==="
+          kubectl logs -n "${NAMESPACE}" -l app="${APP_NAME}" --previous --tail=30 2>/dev/null || echo "No previous logs"
+
+      # =====================================================================
+      # SECTION 6: Service & Ingress
+      # =====================================================================
+      - name: "6️⃣ Check Service & Ingress"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  6️⃣ SERVICE & INGRESS                                                           ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          echo "=== Services ==="
+          kubectl get svc -n "${NAMESPACE}" -o wide 2>/dev/null || echo "No services"
+          echo ""
+          
+          echo "=== Ingress ==="
+          kubectl get ingress -n "${NAMESPACE}" -o wide 2>/dev/null || echo "No ingress"
+          echo ""
+          
+          echo "=== Endpoints ==="
+          kubectl get endpoints -n "${NAMESPACE}" 2>/dev/null || echo "No endpoints"
+
+      # =====================================================================
+      # SECTION 7: ECR Image Check
+      # =====================================================================
+      - name: "7️⃣ Check ECR Image"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  7️⃣ ECR IMAGE STATUS                                                            ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          REPO_NAME="opsera/${{ inputs.app_name }}"
+          
+          echo "=== ECR Repository: ${REPO_NAME} ==="
+          aws ecr describe-repositories --repository-names "${REPO_NAME}" 2>/dev/null && echo "✅ Repository exists" || echo "❌ Repository NOT FOUND"
+          echo ""
+          
+          echo "=== Latest Images ==="
+          aws ecr describe-images --repository-name "${REPO_NAME}" --query 'imageDetails | sort_by(@, &imagePushedAt) | [-5:].[imageTags[0], imagePushedAt]' --output table 2>/dev/null || echo "No images found"
+
+      # =====================================================================
+      # SECTION 8: Summary & Recommendations
+      # =====================================================================
+      - name: "8️⃣ Summary & Recommendations"
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════════════════════════╗"
+          echo "║  8️⃣ SUMMARY & RECOMMENDATIONS                                                   ║"
+          echo "╚══════════════════════════════════════════════════════════════════════════════════╝"
+          echo ""
+          
+          NAMESPACE="${{ inputs.app_name }}-${{ inputs.environment }}"
+          
+          # Connect to spoke cluster for final checks
+          aws eks update-kubeconfig --name ${{ env.SPOKE_CLUSTER }} --region ${{ env.AWS_REGION }}
+          
+          # Check pod state
+          POD_STATUS=$(kubectl get pods -n "${NAMESPACE}" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "None")
+          WAITING_REASON=$(kubectl get pods -n "${NAMESPACE}" -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+          
+          echo "Current State:"
+          echo "  Pod Status: ${POD_STATUS}"
+          echo "  Waiting Reason: ${WAITING_REASON:-N/A}"
+          echo ""
+          
+          echo "Recommendations based on state:"
+          echo ""
+          
+          case "${WAITING_REASON}" in
+            "ImagePullBackOff"|"ErrImagePull")
+              echo "🔴 ISSUE: Cannot pull container image"
+              echo ""
+              echo "   Possible causes:"
+              echo "   1. ECR repository doesn't exist"
+              echo "   2. Image tag doesn't exist"
+              echo "   3. IAM permissions missing on node role"
+              echo ""
+              echo "   Fix:"
+              echo "   - Check ECR repository exists: aws ecr describe-repositories --repository-names opsera/${{ inputs.app_name }}"
+              echo "   - Check image exists: aws ecr list-images --repository-name opsera/${{ inputs.app_name }}"
+              echo "   - Verify node IAM role has ecr:GetDownloadUrlForLayer permission"
+              ;;
+            "CrashLoopBackOff")
+              echo "🔴 ISSUE: Container crashing on startup"
+              echo ""
+              echo "   Check the pod logs above for the crash reason."
+              echo "   Common causes:"
+              echo "   1. Missing environment variables"
+              echo "   2. Application error on startup"
+              echo "   3. Port mismatch"
+              ;;
+            "CreateContainerConfigError")
+              echo "🔴 ISSUE: Container configuration error"
+              echo ""
+              echo "   Check for missing secrets or configmaps."
+              ;;
+            "")
+              if [ "${POD_STATUS}" = "Running" ]; then
+                echo "✅ Pods are running"
+                echo ""
+                echo "   If health is still degraded, check:"
+                echo "   1. Liveness/readiness probes failing"
+                echo "   2. Health endpoint not responding"
+              elif [ "${POD_STATUS}" = "Pending" ]; then
+                echo "🟡 ISSUE: Pods pending"
+                echo ""
+                echo "   Check for:"
+                echo "   1. Insufficient node resources"
+                echo "   2. Node selectors not matching"
+              elif [ "${POD_STATUS}" = "None" ]; then
+                echo "🔴 ISSUE: No pods found"
+                echo ""
+                echo "   Check:"
+                echo "   1. Deployment exists in namespace"
+                echo "   2. ArgoCD has synced the application"
+              fi
+              ;;
+            *)
+              echo "⚠️ Unknown state: ${WAITING_REASON}"
+              echo "   Review the events and logs above for more details."
+              ;;
+          esac

@@ -38,6 +38,12 @@ concurrency:
   group: ci-cd-play1-${{ github.ref }}
   cancel-in-progress: true
 
+# Required for SARIF upload to GitHub Security tab
+permissions:
+  contents: write
+  security-events: write
+  actions: read
+
 jobs:
   # =========================================================================
   # Job 1: Verify Bootstrap
