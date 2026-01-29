@@ -207,6 +207,50 @@ jobs:
           aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
           kubectl cluster-info
 
+      - name: Clean Up Duplicate Clusters
+        run: |
+          CLUSTER_NAME="${{ env.SPOKE_CLUSTER }}"
+          
+          echo "🔍 Checking for duplicate clusters named: ${CLUSTER_NAME}"
+          
+          # Get all cluster secrets with the same name
+          CLUSTER_SECRETS=$(kubectl get secrets -n argocd -l argocd.argoproj.io/secret-type=cluster \
+            -o jsonpath='{range .items[?(@.data.name)]}{.metadata.name}{"\t"}{.data.name}{"\n"}{end}' 2>/dev/null || echo "")
+          
+          # Decode and find duplicates
+          MATCHING_SECRETS=""
+          while IFS=$'\t' read -r secret_name encoded_name; do
+            if [ -n "$encoded_name" ]; then
+              decoded_name=$(echo "$encoded_name" | base64 -d 2>/dev/null || echo "")
+              if [ "$decoded_name" = "$CLUSTER_NAME" ]; then
+                MATCHING_SECRETS="${MATCHING_SECRETS} ${secret_name}"
+              fi
+            fi
+          done <<< "$CLUSTER_SECRETS"
+          
+          # Count matching secrets
+          SECRET_COUNT=$(echo $MATCHING_SECRETS | wc -w | tr -d ' ')
+          
+          if [ "$SECRET_COUNT" -gt "1" ]; then
+            echo "⚠️ Found ${SECRET_COUNT} clusters with name '${CLUSTER_NAME}'"
+            echo "🧹 Removing duplicates, keeping only the first one..."
+            
+            FIRST=true
+            for secret in $MATCHING_SECRETS; do
+              if [ "$FIRST" = true ]; then
+                echo "  ✅ Keeping: ${secret}"
+                FIRST=false
+              else
+                echo "  🗑️ Deleting duplicate: ${secret}"
+                kubectl delete secret "${secret}" -n argocd --ignore-not-found
+              fi
+            done
+            
+            echo "✅ Duplicate clusters cleaned up"
+          else
+            echo "✅ No duplicate clusters found"
+          fi
+
       - name: Create ArgoCD Repository Secret
         run: |
           REPO_URL=$(git remote get-url origin)
