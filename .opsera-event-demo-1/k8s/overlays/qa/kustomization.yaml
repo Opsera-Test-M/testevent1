@@ -18,7 +18,8 @@ commonLabels:
 # Image configuration - will be updated by CI/CD
 images:
   - name: event-demo-1
-    newName: PLACEHOLDER_ECR_URI/opsera/event-demo-1
+    # Format: {aws_account_id}.dkr.ecr.{region}.amazonaws.com/{tenant}/{app}
+    newName: ${AWS_ACCOUNT_ID}.dkr.ecr.us-west-2.amazonaws.com/opsera/event-demo-1
     newTag: latest
 
 # Patches for qa-specific configuration
