@@ -29,7 +29,7 @@ spec:
           # RULE 80: imagePullPolicy: Always is REQUIRED for Argo Rollouts
           imagePullPolicy: Always
           ports:
-            - containerPort: 80
+            - containerPort: 8080
               protocol: TCP
           resources:
             requests:
@@ -42,7 +42,7 @@ spec:
           startupProbe:
             httpGet:
               path: /health
-              port: 80
+              port: 8080
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 30
@@ -50,7 +50,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 80
+              port: 8080
             initialDelaySeconds: 10
             periodSeconds: 15
             timeoutSeconds: 5
@@ -59,7 +59,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /ready
-              port: 80
+              port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
