@@ -21,7 +21,7 @@ images:
     # Format: {aws_account_id}.dkr.ecr.{region}.amazonaws.com/{tenant}/{app}
     # Replace AWS_ACCOUNT_ID with your actual account ID
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/opsera/event-demo-1
-    newTag: latest
+    newTag: 360878b-20260202233224
 
 # Patches for dev-specific configuration
 patches:
