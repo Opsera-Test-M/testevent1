@@ -31,9 +31,6 @@ permissions:
   id-token: write
 
 jobs:
-  # ════════════════════════════════════════════════════════════════════════════
-  # CREATE ENVIRONMENT FILES
-  # ════════════════════════════════════════════════════════════════════════════
   create-environment:
     name: "📁 Create Environment Files"
     runs-on: ubuntu-latest
@@ -66,86 +63,67 @@ jobs:
 
       - name: Create Environment Files
         id: create
+        env:
+          NEW_ENV: ${{ inputs.environment }}
+          REPLICAS: ${{ inputs.replicas }}
+          ACCOUNT_ID: ${{ steps.aws.outputs.account_id }}
         run: |
-          ENV="${{ inputs.environment }}"
-          NAMESPACE="${{ env.TENANT }}-${{ env.APP_NAME }}-${ENV}"
-          SUBDOMAIN="${{ env.TENANT }}-${{ env.APP_NAME }}-${ENV}.${{ env.DOMAIN }}"
-          ECR_URI="${{ steps.aws.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          NAMESPACE="${{ env.TENANT }}-${{ env.APP_NAME }}-${NEW_ENV}"
+          SUBDOMAIN="${{ env.TENANT }}-${{ env.APP_NAME }}-${NEW_ENV}.${{ env.DOMAIN }}"
+          ECR_URI="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           REPO_URL="https://github.com/${{ github.repository }}"
           
           echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
           echo "subdomain=${SUBDOMAIN}" >> $GITHUB_OUTPUT
           
-          # Check if environment already exists
-          if [ -d ".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}" ]; then
-            echo "❌ Environment ${ENV} already exists"
+          if [ -d ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}" ]; then
+            echo "❌ Environment ${NEW_ENV} already exists"
             exit 1
           fi
           
-          # Create overlay directory
-          mkdir -p ".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}"
+          mkdir -p ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}"
+          mkdir -p ".opsera-${{ env.APP_NAME }}/argocd/${NEW_ENV}"
           
           # Create namespace.yaml
-          cat > ".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}/namespace.yaml" << EOF
+          cat > ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}/namespace.yaml" <<NSEOF
           apiVersion: v1
           kind: Namespace
           metadata:
             name: ${NAMESPACE}
             labels:
               app: ${{ env.APP_NAME }}
-              environment: ${ENV}
+              environment: ${NEW_ENV}
               tenant: ${{ env.TENANT }}
-          EOF
+          NSEOF
+          sed -i 's/^          //' ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}/namespace.yaml"
           
           # Create kustomization.yaml
-          cat > ".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}/kustomization.yaml" << EOF
+          cat > ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}/kustomization.yaml" <<KUSTEOF
           apiVersion: kustomize.config.k8s.io/v1beta1
           kind: Kustomization
-          
           namespace: ${NAMESPACE}
-          
           resources:
             - ../../base
             - namespace.yaml
-          
           commonLabels:
-            environment: ${ENV}
-          
+            environment: ${NEW_ENV}
           images:
             - name: ${{ env.APP_NAME }}
               newName: ${ECR_URI}/${{ env.TENANT }}/${{ env.APP_NAME }}
               newTag: latest
-          
-          patches:
-            - target:
-                kind: Ingress
-                name: ${{ env.APP_NAME }}
-              patch: |-
-                - op: replace
-                  path: /spec/rules/0/host
-                  value: ${SUBDOMAIN}
-            - target:
-                kind: Deployment
-                name: ${{ env.APP_NAME }}
-              patch: |-
-                - op: replace
-                  path: /spec/replicas
-                  value: ${{ inputs.replicas }}
-          EOF
-          
-          # Create ArgoCD application directory
-          mkdir -p ".opsera-${{ env.APP_NAME }}/argocd/${ENV}"
+          KUSTEOF
+          sed -i 's/^          //' ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}/kustomization.yaml"
           
           # Create ArgoCD application.yaml
-          cat > ".opsera-${{ env.APP_NAME }}/argocd/${ENV}/application.yaml" << EOF
+          cat > ".opsera-${{ env.APP_NAME }}/argocd/${NEW_ENV}/application.yaml" <<ARGOEOF
           apiVersion: argoproj.io/v1alpha1
           kind: Application
           metadata:
-            name: ${{ env.APP_NAME }}-${ENV}
+            name: ${{ env.APP_NAME }}-${NEW_ENV}
             namespace: argocd
             labels:
               app: ${{ env.APP_NAME }}
-              environment: ${ENV}
+              environment: ${NEW_ENV}
               tenant: ${{ env.TENANT }}
             finalizers:
               - resources-finalizer.argocd.argoproj.io
@@ -154,7 +132,7 @@ jobs:
             source:
               repoURL: ${REPO_URL}
               targetRevision: HEAD
-              path: .opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}
+              path: .opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}
             destination:
               name: ${{ env.SPOKE_CLUSTER }}
               namespace: ${NAMESPACE}
@@ -171,33 +149,28 @@ jobs:
                   duration: 5s
                   factor: 2
                   maxDuration: 3m
-          EOF
+          ARGOEOF
+          sed -i 's/^          //' ".opsera-${{ env.APP_NAME }}/argocd/${NEW_ENV}/application.yaml"
           
           echo "✅ Environment files created"
 
       - name: Commit and Push
+        env:
+          NEW_ENV: ${{ inputs.environment }}
         run: |
-          ENV="${{ inputs.environment }}"
+          git add ".opsera-${{ env.APP_NAME }}/k8s/overlays/${NEW_ENV}/"
+          git add ".opsera-${{ env.APP_NAME }}/argocd/${NEW_ENV}/"
           
-          git add ".opsera-${{ env.APP_NAME }}/k8s/overlays/${ENV}/"
-          git add ".opsera-${{ env.APP_NAME }}/argocd/${ENV}/"
-          
-          git commit -m "feat: Add ${ENV} environment for ${{ env.APP_NAME }} [skip ci]
-
-Environment: ${ENV}
-Namespace: ${{ steps.create.outputs.namespace }}
-URL: https://${{ steps.create.outputs.subdomain }}
-
-Co-Authored-By: Opsera Code-to-Cloud <noreply@opsera.io>"
+          git commit -m "feat: Add ${NEW_ENV} environment for ${{ env.APP_NAME }} [skip ci]" \
+            -m "Namespace: ${{ steps.create.outputs.namespace }}" \
+            -m "URL: https://${{ steps.create.outputs.subdomain }}" \
+            -m "Co-Authored-By: Opsera Code-to-Cloud <noreply@opsera.io>"
           
           git pull --rebase origin main
           git push origin main
           
           echo "✅ Changes committed"
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # APPLY ARGOCD APPLICATION
-  # ════════════════════════════════════════════════════════════════════════════
   apply-argocd:
     name: "🚀 Apply ArgoCD Application"
     runs-on: ubuntu-latest
@@ -220,22 +193,20 @@ Co-Authored-By: Opsera Code-to-Cloud <noreply@opsera.io>"
           aws eks update-kubeconfig --name ${{ env.HUB_CLUSTER }} --region ${{ env.AWS_REGION }}
 
       - name: Pull Latest and Apply
+        env:
+          NEW_ENV: ${{ inputs.environment }}
         run: |
           git pull origin main
           
-          ENV="${{ inputs.environment }}"
-          APP_FILE=".opsera-${{ env.APP_NAME }}/argocd/${ENV}/application.yaml"
+          APP_FILE=".opsera-${{ env.APP_NAME }}/argocd/${NEW_ENV}/application.yaml"
           
           kubectl apply -f "$APP_FILE"
           echo "✅ ArgoCD Application applied"
           
           sleep 5
-          kubectl annotate application "${{ env.APP_NAME }}-${ENV}" -n argocd \
+          kubectl annotate application "${{ env.APP_NAME }}-${NEW_ENV}" -n argocd \
             argocd.argoproj.io/refresh=hard --overwrite || true
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # SUMMARY
-  # ════════════════════════════════════════════════════════════════════════════
   summary:
     name: "📋 Summary"
     runs-on: ubuntu-latest
@@ -244,28 +215,21 @@ Co-Authored-By: Opsera Code-to-Cloud <noreply@opsera.io>"
     steps:
       - name: Generate Summary
         run: |
-          cat << EOF >> $GITHUB_STEP_SUMMARY
-          # ➕ Environment Added: ${{ inputs.environment }}
-
-          ## Configuration
-          | Setting | Value |
-          |---------|-------|
-          | **Environment** | \`${{ inputs.environment }}\` |
-          | **Namespace** | \`${{ needs.create-environment.outputs.namespace }}\` |
-          | **Replicas** | \`${{ inputs.replicas }}\` |
-
-          ## Application URL
-          \`\`\`
-          https://${{ needs.create-environment.outputs.subdomain }}
-          \`\`\`
-
-          ## Next Steps
-          1. Wait for ArgoCD to sync
-          2. Deploy using:
-             \`\`\`bash
-             gh workflow run ci-build-push-${{ env.APP_NAME }}.yaml -f environment=${{ inputs.environment }}
-             \`\`\`
-
-          ---
-          *Generated by Opsera Code-to-Cloud Enterprise v0.903*
-          EOF
+          echo "# ➕ Environment Added: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Namespace** | \`${{ needs.create-environment.outputs.namespace }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Replicas** | \`${{ inputs.replicas }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Application URL" >> $GITHUB_STEP_SUMMARY
+          echo "https://${{ needs.create-environment.outputs.subdomain }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Wait for ArgoCD to sync" >> $GITHUB_STEP_SUMMARY
+          echo "2. Deploy using: gh workflow run ci-build-push-${{ env.APP_NAME }}.yaml -f environment=${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by Opsera Code-to-Cloud Enterprise v0.903*" >> $GITHUB_STEP_SUMMARY
